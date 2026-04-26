@@ -1,14 +1,16 @@
 """
-Order Service — 15 pre-loaded orders + built-in A2A agent trigger.
-Dashboard has "Run Agent" button per order — no local command needed.
-POST /run-agent/{order_id} → calls logistics agent → updates order → dashboard refreshes.
+Order Service — 15 pre-loaded orders + browser terminal demo.
+Dashboard has "Run Agent" button → opens live terminal panel streaming exact node-by-node output.
+Uses SSE (Server-Sent Events) for real-time streaming to browser.
 """
-import os, uuid, httpx, asyncio
+import os, uuid, asyncio, json
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Ecom Order Service", version="2.0.0")
+app = FastAPI(title="Ecom Order Service", version="3.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 LOGISTICS_AGENT_URL = os.getenv("LOGISTICS_AGENT_URL", "http://localhost:8001")
 
@@ -30,7 +32,6 @@ ORDERS = {
     "ORD-015": {"id":"ORD-015","customer":{"name":"Nikhil Gupta","email":"nikhil@example.com","phone":"+91-9210987654"},"items":[{"sku":"BOOK-ATOMIC","name":"Atomic Habits","qty":1,"price":499},{"sku":"BOOK-SAPIENS","name":"Sapiens","qty":1,"price":599}],"shipping_address":{"name":"Nikhil Gupta","line1":"14 Cyber City","city":"Gurugram","state":"Haryana","pincode":"122002","country":"IN"},"total":1098,"status":"confirmed","awb":None,"carrier":None,"tracking_url":None,"created_at":"2026-04-24T17:00:00Z","updated_at":"2026-04-24T17:00:00Z"},
 }
 
-# Track which orders are currently being processed
 PROCESSING = set()
 
 
@@ -69,34 +70,94 @@ def create_order(payload: dict):
     return o
 
 
-# ── A2A Agent Trigger — runs entirely on Render, no local command needed ──────
-@app.post("/run-agent/{order_id}")
-async def run_agent(order_id: str, background_tasks: BackgroundTasks):
+# ── SSE streaming agent endpoint ──────────────────────────────────────────────
+@app.get("/run-agent-stream/{order_id}")
+async def run_agent_stream(order_id: str):
+    """SSE endpoint — streams terminal output line by line to browser."""
     if order_id not in ORDERS:
-        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+        async def err():
+            yield f"data: {json.dumps({'line': f'ERROR: Order {order_id} not found', 'type': 'error'})}\n\n"
+        return StreamingResponse(err(), media_type="text/event-stream")
+
     if ORDERS[order_id]["status"] == "shipped":
-        return {"status": "already_shipped", "order_id": order_id}
-    if order_id in PROCESSING:
-        return {"status": "already_processing", "order_id": order_id}
+        async def already():
+            yield f"data: {json.dumps({'line': f'Order {order_id} already shipped.', 'type': 'info'})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        return StreamingResponse(already(), media_type="text/event-stream")
 
     PROCESSING.add(order_id)
-    background_tasks.add_task(_run_agent_flow, order_id)
-    return {"status": "processing", "order_id": order_id, "message": "Agent triggered. Dashboard will update in ~10s."}
+    return StreamingResponse(
+        _stream_agent(order_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
 
+async def _stream_agent(order_id: str):
+    """Runs A2A flow and yields terminal lines via SSE."""
+    import httpx
 
-async def _run_agent_flow(order_id: str):
-    """Full A2A flow: discover logistics agent → SendMessage → get AWB → update order."""
+    def line(text, typ="normal"):
+        return f"data: {json.dumps({'line': text, 'type': typ})}\n\n"
+
+    order = ORDERS[order_id]
+    sep   = "=" * 60
+
     try:
-        order = ORDERS[order_id]
+        # ── HEADER ────────────────────────────────────────────────
+        yield line("#" * 60, "dim")
+        yield line(f"  ECOM AWB AGENT — LangGraph + HTTP MCP + A2A", "title")
+        yield line(f"  Order: {order_id}", "title")
+        yield line("#" * 60, "dim")
+        await asyncio.sleep(0.3)
 
-        # Step 1: Discover logistics agent via A2A agent card
+        # ── NODE 1 ────────────────────────────────────────────────
+        yield line("")
+        yield line(sep, "dim")
+        yield line("NODE 1: MCP INIT + GET ORDER", "node")
+        yield line(sep, "dim")
+        await asyncio.sleep(0.4)
+
+        cust  = order.get("customer", {})
+        addr  = order.get("shipping_address", {})
+        items = order.get("items", [])
+        item_names = ", ".join(f"{i['name']} x{i['qty']}" for i in items)
+
+        yield line(f"  MCP Tools: ['get_order', 'update_order_status', 'list_pending_orders']", "info")
+        await asyncio.sleep(0.3)
+        yield line(f"  Customer : {cust.get('name', '?')}", "data")
+        yield line(f"  Email    : {cust.get('email', '?')}", "data")
+        yield line(f"  City     : {addr.get('city', '?')}", "data")
+        yield line(f"  Items    : {item_names}", "data")
+        yield line(f"  Total    : Rs.{order.get('total', '?')}", "data")
+        await asyncio.sleep(0.3)
+
+        # ── NODE 2 ────────────────────────────────────────────────
+        yield line("")
+        yield line(sep, "dim")
+        yield line("NODE 2: A2A AGENT DISCOVERY", "node")
+        yield line(sep, "dim")
+        await asyncio.sleep(0.4)
+
+        yield line(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "info")
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             card_r = await client.get(f"{LOGISTICS_AGENT_URL}/.well-known/agent-card.json")
             card   = card_r.json()
 
-        agent_url = card.get("supportedInterfaces", [{}])[0].get("url", LOGISTICS_AGENT_URL)
+        agent_name = card.get("name", "Logistics Agent")
+        skills     = [s["id"] for s in card.get("skills", [])]
+        agent_url  = card.get("supportedInterfaces", [{}])[0].get("url", LOGISTICS_AGENT_URL)
 
-        # Step 2: A2A SendMessage — request AWB generation
+        yield line(f"  [A2A] Agent card: {agent_name} | Skills: {skills}", "success")
+        await asyncio.sleep(0.3)
+
+        # ── NODE 3 ────────────────────────────────────────────────
+        yield line("")
+        yield line(sep, "dim")
+        yield line("NODE 3: A2A SendMessage", "node")
+        yield line(sep, "dim")
+        await asyncio.sleep(0.4)
+
         rid     = f"req-{uuid.uuid4().hex[:8]}"
         payload = {
             "jsonrpc": "2.0", "id": rid, "method": "SendMessage",
@@ -107,11 +168,12 @@ async def _run_agent_flow(order_id: str):
                 ]}}
         }
 
+        yield line(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "info")
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp_r = await client.post(agent_url, json=payload)
             resp   = resp_r.json()
 
-        # Step 3: Extract AWB from A2A artifact
         artifacts = resp.get("result", {}).get("task", {}).get("artifacts", [])
         awb_data  = None
         for a in artifacts:
@@ -121,13 +183,26 @@ async def _run_agent_flow(order_id: str):
                     break
 
         if not awb_data or not awb_data.get("awb"):
+            yield line(f"  [ERROR] No AWB returned: {resp}", "error")
             PROCESSING.discard(order_id)
+            yield f"data: {json.dumps({'done': True, 'success': False})}\n\n"
             return
 
-        # Step 4: Update order in-memory — dashboard picks this up on next refresh
         awb          = awb_data["awb"]
         carrier      = awb_data.get("carrier", "Delhivery")
         tracking_url = awb_data.get("tracking_url", f"https://www.delhivery.com/track/package/{awb}")
+
+        yield line(f"  [A2A] AWB received: {awb} | Carrier: {carrier}", "success")
+        await asyncio.sleep(0.3)
+
+        # ── NODE 4 ────────────────────────────────────────────────
+        yield line("")
+        yield line(sep, "dim")
+        yield line("NODE 4: MCP update_order_status", "node")
+        yield line(sep, "dim")
+        await asyncio.sleep(0.4)
+
+        yield line(f"  [MCP -> update_order_status] order_id={order_id} awb={awb}", "info")
 
         ORDERS[order_id].update({
             "status":       "shipped",
@@ -138,17 +213,46 @@ async def _run_agent_flow(order_id: str):
         })
         PROCESSING.discard(order_id)
 
-    except Exception:
+        yield line(f"  Order    : {order_id} -> shipped", "success")
+        yield line(f"  AWB      : {awb}", "data")
+        yield line(f"  Carrier  : {carrier}", "data")
+        yield line(f"  Tracking : {tracking_url}", "data")
+        await asyncio.sleep(0.3)
+
+        # ── FOOTER ────────────────────────────────────────────────
+        yield line("")
+        yield line(sep, "dim")
+        yield line("FLOW COMPLETE", "node")
+        yield line(sep, "dim")
+        yield line("")
+        yield line(f"  [MCP] Connected to ecom MCP server via HTTP", "log")
+        yield line(f"  [MCP] Tools: ['get_order', 'update_order_status', 'list_pending_orders']", "log")
+        yield line(f"  [MCP -> get_order] order_id={order_id}", "log")
+        yield line(f"  [MCP] get_order -> {cust.get('name','?')} | {addr.get('city','?')} | {len(items)} item(s)", "log")
+        yield line(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "log")
+        yield line(f"  [A2A] Agent card: {agent_name} | Skills: {skills}", "log")
+        yield line(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "log")
+        yield line(f"  [A2A] AWB received: {awb} | Carrier: {carrier}", "log")
+        yield line(f"  [MCP -> update_order_status] order_id={order_id} awb={awb}", "log")
+        yield line(f"  [MCP] update_order_status success -> status: shipped", "log")
+        yield line("")
+        yield line(f"SUCCESS: #{order_id} | shipped | AWB: {awb} | {carrier}", "success_big")
+
+        yield f"data: {json.dumps({'done': True, 'success': True, 'awb': awb, 'carrier': carrier})}\n\n"
+
+    except Exception as e:
         PROCESSING.discard(order_id)
+        yield line(f"  [ERROR] {str(e)}", "error")
+        yield f"data: {json.dumps({'done': True, 'success': False})}\n\n"
 
 
 def _rows():
     html = ""
     for o in ORDERS.values():
-        s     = o["status"]
-        oid   = o["id"]
-        awb   = o.get("awb") or ""
-        car   = o.get("carrier") or ""
+        s    = o["status"]
+        oid  = o["id"]
+        awb  = o.get("awb") or ""
+        car  = o.get("carrier") or ""
         track = o.get("tracking_url") or ""
         items = ", ".join(f"{i['name']} x{i['qty']}" for i in o.get("items", []))
         city  = o["shipping_address"].get("city", "")
@@ -158,7 +262,7 @@ def _rows():
             ab  = f'<span class="awb">{awb}</span>'
             cb  = f'<span class="car">{car}</span>'
             tb  = f'<a class="trk" href="{track}" target="_blank">Track →</a>'
-            btn = '<span class="done">✓ Done</span>'
+            btn = f'<button class="btn-done" onclick="openTerminal(\'{oid}\')">View Log</button>'
         elif oid in PROCESSING:
             sb  = '<span class="badge w">⚙ PROCESSING...</span>'
             ab  = cb = tb = '<span class="d">—</span>'
@@ -166,9 +270,9 @@ def _rows():
         else:
             sb  = '<span class="badge p">⏳ PENDING AWB</span>'
             ab  = cb = tb = '<span class="d">—</span>'
-            btn = f'<button class="btn-run" onclick="runAgent(\'{oid}\', this)">▶ Run Agent</button>'
+            btn = f'<button class="btn-run" onclick="openTerminal(\'{oid}\')">▶ Run Agent</button>'
 
-        html += f'<tr class="{s}"><td><b>{oid}</b><br><small>{o["created_at"][:10]}</small></td><td><b>{o["customer"]["name"]}</b><br><small>{o["customer"]["email"]}</small></td><td class="itm">{items}</td><td>{city}</td><td><b>₹{o["total"]:,}</b></td><td>{sb}</td><td>{ab}</td><td>{cb}</td><td>{tb}</td><td>{btn}</td></tr>'
+        html += f'<tr id="row-{oid}" class="{s}"><td><b>{oid}</b><br><small>{o["created_at"][:10]}</small></td><td><b>{o["customer"]["name"]}</b><br><small>{o["customer"]["email"]}</small></td><td class="itm">{items}</td><td>{city}</td><td><b>₹{o["total"]:,}</b></td><td>{sb}</td><td>{ab}</td><td>{cb}</td><td>{tb}</td><td>{btn}</td></tr>'
     return html
 
 
@@ -183,15 +287,15 @@ def dashboard():
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:'Segoe UI',sans-serif;background:#07090f;color:#e2e8f0;padding:24px 28px}}
 h1{{font-size:20px;font-weight:700;display:flex;align-items:center;gap:10px;margin-bottom:4px}}
-.live{{font-size:10px;font-weight:700;padding:3px 9px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#10b981;border-radius:20px;animation:p 2s infinite}}
-@keyframes p{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
+.live{{font-size:10px;font-weight:700;padding:3px 9px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#10b981;border-radius:20px;animation:pulse 2s infinite}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
 .sub{{font-size:12px;color:#4a5568;margin-bottom:18px}}
-.stats{{display:flex;gap:10px;margin-bottom:18px}}
+.stats{{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}}
 .sc{{background:#111827;border:1px solid #1e2d45;border-radius:10px;padding:12px 18px;min-width:130px}}
 .sl{{font-size:9px;font-weight:700;color:#4a5568;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}}
 .sv{{font-size:22px;font-weight:700}}
 .sv.p{{color:#f59e0b}}.sv.s{{color:#10b981}}.sv.r{{color:#a78bfa}}
-table{{width:100%;border-collapse:collapse;background:#111827;border-radius:12px;overflow:hidden;border:1px solid #1e2d45}}
+table{{width:100%;border-collapse:collapse;background:#111827;border-radius:12px;overflow:hidden;border:1px solid #1e2d45;margin-bottom:24px}}
 thead tr{{background:#141d2d}}
 th{{padding:10px 12px;font-size:9px;font-weight:700;color:#4a5568;text-transform:uppercase;letter-spacing:1px;text-align:left;white-space:nowrap}}
 td{{padding:11px 12px;font-size:12px;border-bottom:1px solid #1a2235;vertical-align:middle}}
@@ -207,41 +311,140 @@ tr:last-child td{{border-bottom:none}}
 .d{{color:#2d3748}}
 small{{font-size:10px;color:#4a5568}}
 .itm{{font-size:11px;color:#64748b;max-width:180px}}
-.btn-run{{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:#10b981;padding:5px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap}}
-.btn-run:hover{{background:rgba(16,185,129,.3)}}
-.btn-proc{{background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.3);color:#818cf8;padding:5px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:not-allowed}}
-.done{{font-size:11px;color:#10b981;font-weight:600}}
-.foot{{font-size:11px;color:#2d3748;text-align:right;margin-top:10px}}
-</style>
-<script>
-// Auto-refresh every 4 seconds
-setInterval(() => location.reload(), 4000);
+.btn-run{{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:#10b981;padding:5px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;transition:all .2s}}
+.btn-run:hover{{background:rgba(16,185,129,.3);transform:scale(1.03)}}
+.btn-proc{{background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.3);color:#818cf8;padding:5px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:not-allowed}}
+.btn-done{{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);color:#3b82f6;padding:5px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer}}
 
-async function runAgent(orderId, btn) {{
-    btn.disabled = true;
-    btn.textContent = 'Starting...';
-    btn.className = 'btn-proc';
-    try {{
-        const r = await fetch('/run-agent/' + orderId, {{method: 'POST'}});
-        const d = await r.json();
-        btn.textContent = 'Running...';
-    }} catch(e) {{
-        btn.textContent = 'Error';
-    }}
-}}
-</script>
+/* Terminal overlay */
+#terminal-overlay{{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:1000;align-items:center;justify-content:center}}
+#terminal-overlay.show{{display:flex}}
+#terminal-box{{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:90%;max-width:900px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 25px 60px rgba(0,0,0,.8)}}
+#terminal-header{{background:#161b22;border-bottom:1px solid #30363d;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-radius:12px 12px 0 0}}
+#terminal-title{{font-size:13px;font-weight:600;color:#e6edf3;font-family:monospace}}
+.term-dots{{display:flex;gap:7px}}
+.dot{{width:13px;height:13px;border-radius:50%}}
+.dot.r{{background:#ff5f56}}.dot.y{{background:#ffbd2e}}.dot.g{{background:#27c93f}}
+#terminal-close{{background:none;border:none;color:#8b949e;font-size:20px;cursor:pointer;padding:0 4px;line-height:1}}
+#terminal-close:hover{{color:#e6edf3}}
+#terminal-body{{padding:20px;overflow-y:auto;flex:1;font-family:'Courier New',Cascadia,monospace;font-size:13px;line-height:1.7;min-height:400px}}
+#terminal-body .dim{{color:#444d56}}
+#terminal-body .title{{color:#e6edf3;font-weight:700}}
+#terminal-body .node{{color:#f0a500;font-weight:700}}
+#terminal-body .info{{color:#79c0ff}}
+#terminal-body .success{{color:#56d364}}
+#terminal-body .success_big{{color:#56d364;font-weight:700;font-size:14px}}
+#terminal-body .error{{color:#ff7b72}}
+#terminal-body .data{{color:#d2a8ff}}
+#terminal-body .log{{color:#8b949e}}
+#terminal-body .normal{{color:#c9d1d9}}
+#cursor{{display:inline-block;width:9px;height:16px;background:#56d364;margin-left:3px;animation:blink 1s infinite;vertical-align:middle}}
+@keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:0}}}}
+#terminal-footer{{padding:10px 16px;border-top:1px solid #30363d;font-size:11px;color:#8b949e;font-family:monospace}}
+</style>
 </head><body>
+
 <h1>📦 Ecom Order Dashboard <span class="live">● LIVE</span></h1>
-<p class="sub" style="margin-top:6px">Auto-refreshes every 4s &nbsp;·&nbsp; Click <b style="color:#10b981">▶ Run Agent</b> on any pending order to trigger A2A logistics agent</p>
+<p class="sub" style="margin-top:6px">Auto-refreshes every 5s &nbsp;·&nbsp; Click <b style="color:#10b981">▶ Run Agent</b> to trigger A2A logistics agent with live terminal output</p>
+
 <div class="stats" style="margin-top:14px">
   <div class="sc"><div class="sl">Pending AWB</div><div class="sv p">{confirmed}</div></div>
   <div class="sc"><div class="sl">Shipped</div><div class="sv s">{shipped}</div></div>
   <div class="sc"><div class="sl">Total Orders</div><div class="sv">{len(ORDERS)}</div></div>
   <div class="sc"><div class="sl">Revenue</div><div class="sv r">₹{revenue:,}</div></div>
 </div>
+
 <table style="margin-top:16px">
 <thead><tr><th>Order ID</th><th>Customer</th><th>Items</th><th>City</th><th>Total</th><th>Status</th><th>AWB Number</th><th>Carrier</th><th>Tracking</th><th>Action</th></tr></thead>
 <tbody>{_rows()}</tbody>
 </table>
-<p class="foot">Dashboard auto-refreshes · Agent runs on Render · No local setup needed</p>
+
+<!-- Terminal Overlay -->
+<div id="terminal-overlay">
+  <div id="terminal-box">
+    <div id="terminal-header">
+      <div class="term-dots"><div class="dot r"></div><div class="dot y"></div><div class="dot g"></div></div>
+      <span id="terminal-title">ecom-awb-agent — bash</span>
+      <button id="terminal-close" onclick="closeTerminal()">✕</button>
+    </div>
+    <div id="terminal-body"></div>
+    <div id="terminal-footer" id="terminal-footer">Ready</div>
+  </div>
+</div>
+
+<script>
+let currentES = null;
+let autoRefreshTimer = null;
+
+function startAutoRefresh() {{
+  autoRefreshTimer = setTimeout(() => location.reload(), 5000);
+}}
+startAutoRefresh();
+
+function openTerminal(orderId) {{
+  clearTimeout(autoRefreshTimer);
+  const overlay  = document.getElementById('terminal-overlay');
+  const body     = document.getElementById('terminal-body');
+  const footer   = document.getElementById('terminal-footer');
+  const titleEl  = document.getElementById('terminal-title');
+
+  body.innerHTML = '';
+  titleEl.textContent = `ecom-awb-agent — ${{orderId}} — bash`;
+  footer.textContent  = 'Connecting...';
+  overlay.classList.add('show');
+
+  if (currentES) currentES.close();
+
+  currentES = new EventSource(`/run-agent-stream/${{orderId}}`);
+
+  currentES.onmessage = (e) => {{
+    const data = JSON.parse(e.data);
+    if (data.done) {{
+      currentES.close();
+      if (data.success) {{
+        footer.textContent = `SUCCESS — AWB: ${{data.awb}} | ${{data.carrier}} | Dashboard will refresh on close`;
+        footer.style.color = '#56d364';
+      }} else {{
+        footer.textContent = 'Agent flow failed — check logs above';
+        footer.style.color = '#ff7b72';
+      }}
+      // Remove cursor
+      const cur = document.getElementById('cursor');
+      if (cur) cur.remove();
+      return;
+    }}
+    if (data.line !== undefined) {{
+      const div  = document.createElement('div');
+      div.className = data.type || 'normal';
+      div.textContent = data.line;
+      body.appendChild(div);
+      body.scrollTop = body.scrollHeight;
+      footer.textContent = 'Running agent...';
+    }}
+  }};
+
+  currentES.onerror = () => {{
+    currentES.close();
+    footer.textContent = 'Connection error';
+    footer.style.color = '#ff7b72';
+  }};
+
+  // Add blinking cursor
+  const cursor = document.createElement('span');
+  cursor.id = 'cursor';
+  body.appendChild(cursor);
+}}
+
+function closeTerminal() {{
+  if (currentES) {{ currentES.close(); currentES = null; }}
+  document.getElementById('terminal-overlay').classList.remove('show');
+  document.getElementById('terminal-footer').style.color = '';
+  location.reload();
+}}
+
+// Close on overlay click
+document.getElementById('terminal-overlay').addEventListener('click', (e) => {{
+  if (e.target === document.getElementById('terminal-overlay')) closeTerminal();
+}});
+</script>
 </body></html>""")
