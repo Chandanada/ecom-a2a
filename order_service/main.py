@@ -43,6 +43,29 @@ ORDERS = {
 PROCESSING  = set()
 LOG_HISTORY = {}
 
+COLD_START_RETRIES = 3
+COLD_START_WAIT    = 15  # seconds
+
+async def wake_service(url: str, name: str, evt_fn=None) -> bool:
+    """Ping Render service health endpoint — waits through cold start."""
+    for attempt in range(1, COLD_START_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.get(f"{url}/health")
+                if r.status_code == 200:
+                    if evt_fn:
+                        yield evt_fn(f"  [WAKE] {name} is awake ✓", "success")
+                    return True
+        except Exception:
+            pass
+        if attempt < COLD_START_RETRIES:
+            if evt_fn:
+                yield evt_fn(f"  [WAKE] {name} cold starting... retry {attempt}/{COLD_START_RETRIES} (wait {COLD_START_WAIT}s)", "info")
+            await asyncio.sleep(COLD_START_WAIT)
+    if evt_fn:
+        yield evt_fn(f"  [WAKE] {name} health check failed — proceeding anyway", "log")
+    return False
+
 
 @app.get("/health")
 def health():
@@ -181,6 +204,14 @@ async def _stream_ship(order_id: str):
         await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
+        yield evt("NODE 0: WAKE RENDER SERVICES", "node")
+        yield evt(sep, "dim"); await asyncio.sleep(0.2)
+        yield evt(f"  [WAKE] Pinging Logistics Agent...", "info")
+        async for line in wake_service(LOGISTICS_AGENT_URL, "Logistics Agent", evt):
+            yield line
+        await asyncio.sleep(0.2)
+
+        yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: MCP INIT + GET ORDER", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
@@ -290,6 +321,16 @@ async def _stream_return(order_id: str):
         yield evt("#" * 60, "dim"); await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
+        yield evt("NODE 0: WAKE RENDER SERVICES", "node")
+        yield evt(sep, "dim"); await asyncio.sleep(0.2)
+        yield evt(f"  [WAKE] Pinging Returns Agent + Logistics Agent...", "info")
+        async for line in wake_service(RETURNS_AGENT_URL, "Returns Agent", evt):
+            yield line
+        async for line in wake_service(LOGISTICS_AGENT_URL, "Logistics Agent", evt):
+            yield line
+        await asyncio.sleep(0.2)
+
+        yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: RETURN ELIGIBILITY CHECK", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
@@ -392,6 +433,16 @@ async def _stream_refund(order_id: str):
         yield evt(f"  REFUND AGENT + INVENTORY AGENT — A2A Chain", "title")
         yield evt(f"  Order: {order_id}", "title")
         yield evt("#" * 60, "dim"); await asyncio.sleep(0.3)
+
+        yield evt(""); yield evt(sep, "dim")
+        yield evt("NODE 0: WAKE RENDER SERVICES", "node")
+        yield evt(sep, "dim"); await asyncio.sleep(0.2)
+        yield evt(f"  [WAKE] Pinging Refund Agent + Inventory Agent + MCP Server...", "info")
+        async for line in wake_service(REFUND_AGENT_URL, "Refund Agent", evt):
+            yield line
+        async for line in wake_service(INVENTORY_MCP_URL, "Inventory MCP Server", evt):
+            yield line
+        await asyncio.sleep(0.2)
 
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: A2A → REFUND AGENT", "node")
