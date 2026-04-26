@@ -13,6 +13,16 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
+# LangSmith tracing
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+os.environ.setdefault("LANGCHAIN_PROJECT",    "ecom-awb-a2a")
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(name=None, run_type=None):
+        def decorator(fn): return fn
+        return decorator
+
 app = FastAPI(title="Ecom Order Service", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -186,6 +196,9 @@ async def run_refund_stream(order_id: str):
 
 # ── Agent flow implementations ─────────────────────────────────────────────────
 
+@traceable(name="ship_order_agent", run_type="chain")
+async def _trace_ship(order_id: str, order_data: dict): pass  # LangSmith trace anchor
+
 async def _stream_ship(order_id: str):
     sep   = "=" * 60
     order = ORDERS[order_id]
@@ -209,6 +222,10 @@ async def _stream_ship(order_id: str):
         async for line in wake_service(LOGISTICS_AGENT_URL, "Logistics Agent", evt):
             yield line
         await asyncio.sleep(0.2)
+
+        # Fire LangSmith trace
+        try: _trace_ship(order_id, order)
+        except: pass
 
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: MCP INIT + GET ORDER", "node")
@@ -302,6 +319,9 @@ async def _stream_ship(order_id: str):
         yield evt(f"  [ERROR] {str(e)}", "error")
         yield f"data: {json.dumps({'done':True,'success':False})}\n\n"
 
+
+@traceable(name="return_order_agent", run_type="chain")
+async def _trace_return(order_id: str, order_data: dict): pass  # LangSmith trace anchor
 
 async def _stream_return(order_id: str):
     sep     = "=" * 60
@@ -449,6 +469,9 @@ async def _stream_return(order_id: str):
         yield evt(f"  [ERROR] {str(e)}", "error")
         yield f"data: {json.dumps({'done':True,'success':False})}\n\n"
 
+
+@traceable(name="refund_order_agent", run_type="chain")
+async def _trace_refund(order_id: str, order_data: dict): pass  # LangSmith trace anchor
 
 async def _stream_refund(order_id: str):
     sep     = "=" * 60
