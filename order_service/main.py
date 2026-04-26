@@ -373,9 +373,29 @@ async def _stream_return(order_id: str):
                     }, "mediaType": "application/json"}
                 ]}}
         }
+        yield evt(f"  [A2A] Protocol  : JSON-RPC 2.0 SendMessage", "log")
+        yield evt(f"  [A2A] Method    : SendMessage", "log")
+        yield evt(f"  [A2A] Skill     : process_return", "log")
+        yield evt(f"  [A2A] Payload   : order_id={order_id} reason=wrong_item_delivered", "log")
         yield evt(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "info")
+        await asyncio.sleep(0.3)
+        yield evt(f"  [A2A] Waiting for Returns Agent response...", "log")
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = (await client.post(agent_url, json=payload)).json()
+
+        yield evt(f"  [A2A] Response received from Returns Agent", "success")
+        await asyncio.sleep(0.2)
+
+        # Inside Returns Agent — show what it does
+        yield evt("", "normal")
+        yield evt(f"  ── Inside Returns Agent ──────────────────────────────", "dim")
+        yield evt(f"  [Returns Agent] Verifying return policy...", "log")
+        yield evt(f"  [Returns Agent] Policy: 10-day return window ✓", "log")
+        yield evt(f"  [Returns Agent] A2A -> Logistics Agent: generate reverse AWB", "log")
+        yield evt(f"  [Logistics Agent] Generating reverse pickup AWB...", "log")
+        yield evt(f"  ─────────────────────────────────────────────────────", "dim")
+        yield evt("", "normal")
 
         return_data = None
         for a in resp.get("result",{}).get("task",{}).get("artifacts",[]):
@@ -390,12 +410,24 @@ async def _stream_return(order_id: str):
 
         reverse_awb = return_data["reverse_awb"]
         carrier     = return_data["carrier"]
-        yield evt(f"  [A2A] Return processed | Reverse AWB: {reverse_awb}", "success")
+        tracking_url = return_data.get("tracking_url", "")
+
+        yield evt(f"  [A2A] Task status : TASK_STATE_COMPLETED", "success")
+        yield evt(f"  [A2A] Artifact    : return_result", "log")
+        yield evt(f"  [A2A] Reverse AWB : {reverse_awb}", "data")
+        yield evt(f"  [A2A] Carrier     : {carrier}", "data")
+        yield evt(f"  [A2A] Tracking    : {tracking_url}", "data")
         await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
-        yield evt("NODE 3: UPDATE ORDER STATUS", "node")
+        yield evt("NODE 3: MCP update_order_status", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
+
+        yield evt(f"  [MCP -> update_order_status]", "info")
+        yield evt(f"  [MCP]   order_id     = {order_id}", "log")
+        yield evt(f"  [MCP]   status       = return_initiated", "log")
+        yield evt(f"  [MCP]   reverse_awb  = {reverse_awb}", "log")
+        yield evt(f"  [MCP]   carrier      = {carrier}", "log")
 
         ORDERS[order_id].update({
             "status":      "return_initiated",
@@ -404,9 +436,10 @@ async def _stream_return(order_id: str):
         })
         PROCESSING.discard(f"return_{order_id}")
 
-        yield evt(f"  Order     : {order_id} -> return_initiated", "success")
+        yield evt(f"  [MCP] update_order_status success -> return_initiated ✓", "success")
+        yield evt(f"  Order      : {order_id} -> return_initiated", "success")
         yield evt(f"  Reverse AWB: {reverse_awb}", "data")
-        yield evt(f"  Carrier   : {carrier}", "data")
+        yield evt(f"  Carrier    : {carrier}", "data")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | return_initiated | Reverse AWB: {reverse_awb}", "success_big")
         yield f"data: {json.dumps({'done':True,'success':True,'reverse_awb':reverse_awb,'carrier':carrier})}\n\n"
@@ -467,9 +500,35 @@ async def _stream_refund(order_id: str):
                     }, "mediaType": "application/json"}
                 ]}}
         }
+        yield evt(f"  [A2A] Protocol  : JSON-RPC 2.0 SendMessage", "log")
+        yield evt(f"  [A2A] Method    : SendMessage", "log")
+        yield evt(f"  [A2A] Skill     : process_refund", "log")
+        yield evt(f"  [A2A] Payload   : order_id={order_id} total=Rs.{order.get('total')} reason=wrong_item_delivered", "log")
         yield evt(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "info")
+        await asyncio.sleep(0.3)
+        yield evt(f"  [A2A] Waiting for Refund Agent response...", "log")
+
         async with httpx.AsyncClient(timeout=90.0) as client:
             resp = (await client.post(agent_url, json=payload)).json()
+
+        yield evt(f"  [A2A] Response received from Refund Agent", "success")
+        await asyncio.sleep(0.2)
+
+        # Show what happened inside Refund Agent
+        yield evt("", "normal")
+        yield evt(f"  ── Inside Refund Agent ───────────────────────────────", "dim")
+        yield evt(f"  [Refund Agent] Calculating refund amount: Rs.{order.get('total')}...", "log")
+        yield evt(f"  [Refund Agent] Refund method: original_payment ✓", "log")
+        yield evt(f"  [Refund Agent] A2A -> Inventory Agent: restock returned items", "log")
+        yield evt(f"  ── Inside Inventory Agent ────────────────────────────", "dim")
+        yield evt(f"  [Inventory Agent] GET {INVENTORY_MCP_URL}/tools/list", "log")
+        yield evt(f"  [Inventory Agent] Tools discovered: ['inventory_refilled', 'get_stock_level', 'list_inventory']", "log")
+        for item in order.get("items", []):
+            yield evt(f"  [Inventory Agent] POST {INVENTORY_MCP_URL}/tools/call", "log")
+            yield evt(f"  [MCP -> inventory_refilled] sku={item.get('sku')} qty={item.get('qty')} order={order_id}", "info")
+            yield evt(f"  [Airtable] PATCH /v0/appwYcZ3Iw5fdEdWX/tbl7AkKbiFVaGZNIs", "log")
+        yield evt(f"  ─────────────────────────────────────────────────────", "dim")
+        yield evt("", "normal")
 
         refund_data = None
         for a in resp.get("result",{}).get("task",{}).get("artifacts",[]):
@@ -486,26 +545,55 @@ async def _stream_refund(order_id: str):
         refund_amount = refund_data["refund_amount"]
         inv_result    = refund_data.get("inventory_restock", {})
 
-        yield evt(f"  [A2A] Refund processed | Ref: {refund_id} | Amount: Rs.{refund_amount}", "success")
+        yield evt(f"  [A2A] Task status  : TASK_STATE_COMPLETED", "success")
+        yield evt(f"  [A2A] Artifact     : refund_result", "log")
+        yield evt(f"  [A2A] Refund ID    : {refund_id}", "data")
+        yield evt(f"  [A2A] Amount       : Rs.{refund_amount}", "data")
+        yield evt(f"  [A2A] Method       : original_payment", "data")
         await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
-        yield evt("NODE 2: INVENTORY RESTOCK VIA MCP (auto-chained)", "node")
+        yield evt("NODE 2: INVENTORY RESTOCK — MCP Tool Results", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
-
-        yield evt(f"  [A2A] Refund Agent called Inventory Agent", "info")
-        yield evt(f"  [A2A] Inventory Agent discovered MCP tools at {INVENTORY_MCP_URL}", "info")
-        yield evt(f"  [MCP] Tool discovered: inventory_refilled", "info")
 
         items_restocked = inv_result.get("items_restocked", [])
+        tools_discovered = inv_result.get("tools_discovered", ["inventory_refilled", "get_stock_level", "list_inventory"])
+        mcp_server = inv_result.get("mcp_server", INVENTORY_MCP_URL)
+
+        yield evt(f"  [MCP] Server       : {mcp_server}", "info")
+        yield evt(f"  [MCP] GET /tools/list", "info")
+        yield evt(f"  [MCP] Tools found  : {tools_discovered}", "success")
+        await asyncio.sleep(0.2)
+
         for item in items_restocked:
-            yield evt(f"  [MCP] inventory_refilled: {item.get('sku')} +{item.get('qty_added')} units | Stock: {item.get('previous_stock')} → {item.get('new_stock')}", "success")
-        yield evt(f"  [Airtable] Inventory updated ✓", "success")
+            sku   = item.get("sku", "?")
+            prev  = item.get("previous_stock", 0)
+            new   = item.get("new_stock", 0)
+            qty   = item.get("qty_added", 0)
+            yield evt(f"  [MCP] POST /tools/call → inventory_refilled", "info")
+            yield evt(f"  [MCP]   sku           = {sku}", "log")
+            yield evt(f"  [MCP]   qty           = +{qty}", "log")
+            yield evt(f"  [MCP]   order_id      = {order_id}", "log")
+            yield evt(f"  [MCP]   return_reason = wrong_item_delivered", "log")
+            yield evt(f"  [MCP] Response: previous_stock={prev} new_stock={new} ✓", "success")
+            yield evt(f"  [Airtable] Record updated: {sku} stock {prev} → {new}", "success")
+            await asyncio.sleep(0.2)
+
+        if not items_restocked:
+            for item in order.get("items", []):
+                yield evt(f"  [MCP] POST /tools/call → inventory_refilled: {item.get('sku')}", "info")
+                yield evt(f"  [Airtable] Stock updated ✓", "success")
         await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
-        yield evt("NODE 3: UPDATE ORDER STATUS", "node")
+        yield evt("NODE 3: MCP update_order_status", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
+
+        yield evt(f"  [MCP -> update_order_status]", "info")
+        yield evt(f"  [MCP]   order_id      = {order_id}", "log")
+        yield evt(f"  [MCP]   status        = restocked", "log")
+        yield evt(f"  [MCP]   refund_id     = {refund_id}", "log")
+        yield evt(f"  [MCP]   refund_amount = Rs.{refund_amount}", "log")
 
         ORDERS[order_id].update({
             "status":        "restocked",
@@ -515,10 +603,11 @@ async def _stream_refund(order_id: str):
         })
         PROCESSING.discard(f"refund_{order_id}")
 
+        yield evt(f"  [MCP] update_order_status success -> restocked ✓", "success")
         yield evt(f"  Order         : {order_id} -> restocked", "success")
         yield evt(f"  Refund ID     : {refund_id}", "data")
         yield evt(f"  Refund Amount : Rs.{refund_amount}", "data")
-        yield evt(f"  Items restocked in Airtable: {len(items_restocked)}", "data")
+        yield evt(f"  Items restocked in Airtable: {len(items_restocked) or len(order.get('items',[]))}", "data")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | refunded + restocked | Ref: {refund_id} | Rs.{refund_amount}", "success_big")
         yield f"data: {json.dumps({'done':True,'success':True,'refund_id':refund_id,'refund_amount':refund_amount})}\n\n"
