@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: ecom-order-service
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn order_service.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+    plan: free
+
+  - type: web
+    name: ecom-logistics-agent
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn logistics_agent.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: GROQ_API_KEY
+        sync: false
+    plan: free
