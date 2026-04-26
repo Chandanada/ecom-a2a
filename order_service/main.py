@@ -28,13 +28,18 @@ def ls_trace(name: str, inputs: dict, outputs: dict = None, error: str = None):
         run_id = str(_uuid.uuid4())
         now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
         payload = {
-            "id": run_id, "name": name, "run_type": "chain",
-            "inputs": inputs, "outputs": outputs or {},
-            "start_time": now, "end_time": now,
-            "project_name": project,
-            "status": "error" if error else "success",
-            "error": error
+            "id": run_id,
+            "name": name,
+            "run_type": "chain",
+            "inputs": inputs,
+            "outputs": outputs or {},
+            "start_time": now,
+            "end_time": now,
+            "session_name": project,
+            "extra": {"metadata": {"project": project}}
         }
+        if error:
+            payload["error"] = error
         _httpx.post(
             "https://api.smith.langchain.com/runs",
             json=payload,
