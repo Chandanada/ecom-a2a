@@ -46,8 +46,8 @@ LOG_HISTORY = {}
 COLD_START_RETRIES = 3
 COLD_START_WAIT    = 15  # seconds
 
-async def wake_service(url: str, name: str, evt_fn=None) -> bool:
-    """Ping Render service health endpoint — waits through cold start."""
+async def wake_service(url: str, name: str, evt_fn=None):
+    """Ping Render service health endpoint — waits through cold start. Async generator."""
     for attempt in range(1, COLD_START_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
@@ -55,7 +55,7 @@ async def wake_service(url: str, name: str, evt_fn=None) -> bool:
                 if r.status_code == 200:
                     if evt_fn:
                         yield evt_fn(f"  [WAKE] {name} is awake ✓", "success")
-                    return True
+                    return
         except Exception:
             pass
         if attempt < COLD_START_RETRIES:
@@ -64,7 +64,6 @@ async def wake_service(url: str, name: str, evt_fn=None) -> bool:
             await asyncio.sleep(COLD_START_WAIT)
     if evt_fn:
         yield evt_fn(f"  [WAKE] {name} health check failed — proceeding anyway", "log")
-    return False
 
 
 @app.get("/health")
