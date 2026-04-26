@@ -1,7 +1,8 @@
 """
 Order Service — 15 pre-loaded orders + browser terminal demo.
-Dashboard has "Run Agent" button → opens live terminal panel streaming exact node-by-node output.
-Uses SSE (Server-Sent Events) for real-time streaming to browser.
+- No auto-refresh (manual refresh button only)
+- Log history stored per order — replay any time via "View Log"
+- Run Agent streams live terminal output via SSE
 """
 import os, uuid, asyncio, json
 from datetime import datetime
@@ -33,6 +34,8 @@ ORDERS = {
 }
 
 PROCESSING = set()
+# Persistent log history: {order_id: [{"line": ..., "type": ...}, ...]}
+LOG_HISTORY = {}
 
 
 @app.get("/health")
@@ -69,76 +72,85 @@ def create_order(payload: dict):
     ORDERS[oid] = o
     return o
 
+# ── Log history endpoint ───────────────────────────────────────────────────────
+@app.get("/logs/{order_id}")
+def get_logs(order_id: str):
+    return {"order_id": order_id, "logs": LOG_HISTORY.get(order_id, [])}
+
 
 # ── SSE streaming agent endpoint ──────────────────────────────────────────────
 @app.get("/run-agent-stream/{order_id}")
 async def run_agent_stream(order_id: str):
-    """SSE endpoint — streams terminal output line by line to browser."""
     if order_id not in ORDERS:
         async def err():
             yield f"data: {json.dumps({'line': f'ERROR: Order {order_id} not found', 'type': 'error'})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'success': False})}\n\n"
         return StreamingResponse(err(), media_type="text/event-stream")
 
-    if ORDERS[order_id]["status"] == "shipped":
-        async def already():
-            yield f"data: {json.dumps({'line': f'Order {order_id} already shipped.', 'type': 'info'})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
-        return StreamingResponse(already(), media_type="text/event-stream")
+    if ORDERS[order_id]["status"] == "shipped" and order_id in LOG_HISTORY:
+        # Replay stored log
+        async def replay():
+            for entry in LOG_HISTORY[order_id]:
+                yield f"data: {json.dumps(entry)}\n\n"
+                await asyncio.sleep(0.02)
+            yield f"data: {json.dumps({'done': True, 'success': True, 'replayed': True, 'awb': ORDERS[order_id].get('awb'), 'carrier': ORDERS[order_id].get('carrier')})}\n\n"
+        return StreamingResponse(replay(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     PROCESSING.add(order_id)
+    LOG_HISTORY[order_id] = []  # reset log for this run
     return StreamingResponse(
         _stream_agent(order_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
 
+
 async def _stream_agent(order_id: str):
-    """Runs A2A flow and yields terminal lines via SSE."""
     import httpx
 
-    def line(text, typ="normal"):
-        return f"data: {json.dumps({'line': text, 'type': typ})}\n\n"
+    def evt(text, typ="normal"):
+        entry = {"line": text, "type": typ}
+        LOG_HISTORY[order_id].append(entry)
+        return f"data: {json.dumps(entry)}\n\n"
 
     order = ORDERS[order_id]
     sep   = "=" * 60
 
     try:
-        # ── HEADER ────────────────────────────────────────────────
-        yield line("#" * 60, "dim")
-        yield line(f"  ECOM AWB AGENT — LangGraph + HTTP MCP + A2A", "title")
-        yield line(f"  Order: {order_id}", "title")
-        yield line("#" * 60, "dim")
+        yield evt("#" * 60, "dim")
+        yield evt(f"  ECOM AWB AGENT — LangGraph + HTTP MCP + A2A", "title")
+        yield evt(f"  Order: {order_id}", "title")
+        yield evt("#" * 60, "dim")
         await asyncio.sleep(0.3)
 
-        # ── NODE 1 ────────────────────────────────────────────────
-        yield line("")
-        yield line(sep, "dim")
-        yield line("NODE 1: MCP INIT + GET ORDER", "node")
-        yield line(sep, "dim")
+        yield evt("", "normal")
+        yield evt(sep, "dim")
+        yield evt("NODE 1: MCP INIT + GET ORDER", "node")
+        yield evt(sep, "dim")
         await asyncio.sleep(0.4)
 
-        cust  = order.get("customer", {})
-        addr  = order.get("shipping_address", {})
-        items = order.get("items", [])
+        cust       = order.get("customer", {})
+        addr       = order.get("shipping_address", {})
+        items      = order.get("items", [])
         item_names = ", ".join(f"{i['name']} x{i['qty']}" for i in items)
 
-        yield line(f"  MCP Tools: ['get_order', 'update_order_status', 'list_pending_orders']", "info")
+        yield evt(f"  MCP Tools: ['get_order', 'update_order_status', 'list_pending_orders']", "info")
         await asyncio.sleep(0.3)
-        yield line(f"  Customer : {cust.get('name', '?')}", "data")
-        yield line(f"  Email    : {cust.get('email', '?')}", "data")
-        yield line(f"  City     : {addr.get('city', '?')}", "data")
-        yield line(f"  Items    : {item_names}", "data")
-        yield line(f"  Total    : Rs.{order.get('total', '?')}", "data")
+        yield evt(f"  Customer : {cust.get('name', '?')}", "data")
+        yield evt(f"  Email    : {cust.get('email', '?')}", "data")
+        yield evt(f"  City     : {addr.get('city', '?')}", "data")
+        yield evt(f"  Items    : {item_names}", "data")
+        yield evt(f"  Total    : Rs.{order.get('total', '?')}", "data")
         await asyncio.sleep(0.3)
 
-        # ── NODE 2 ────────────────────────────────────────────────
-        yield line("")
-        yield line(sep, "dim")
-        yield line("NODE 2: A2A AGENT DISCOVERY", "node")
-        yield line(sep, "dim")
+        yield evt("", "normal")
+        yield evt(sep, "dim")
+        yield evt("NODE 2: A2A AGENT DISCOVERY", "node")
+        yield evt(sep, "dim")
         await asyncio.sleep(0.4)
 
-        yield line(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "info")
+        yield evt(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "info")
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             card_r = await client.get(f"{LOGISTICS_AGENT_URL}/.well-known/agent-card.json")
@@ -148,14 +160,13 @@ async def _stream_agent(order_id: str):
         skills     = [s["id"] for s in card.get("skills", [])]
         agent_url  = card.get("supportedInterfaces", [{}])[0].get("url", LOGISTICS_AGENT_URL)
 
-        yield line(f"  [A2A] Agent card: {agent_name} | Skills: {skills}", "success")
+        yield evt(f"  [A2A] Agent card: {agent_name} | Skills: {skills}", "success")
         await asyncio.sleep(0.3)
 
-        # ── NODE 3 ────────────────────────────────────────────────
-        yield line("")
-        yield line(sep, "dim")
-        yield line("NODE 3: A2A SendMessage", "node")
-        yield line(sep, "dim")
+        yield evt("", "normal")
+        yield evt(sep, "dim")
+        yield evt("NODE 3: A2A SendMessage", "node")
+        yield evt(sep, "dim")
         await asyncio.sleep(0.4)
 
         rid     = f"req-{uuid.uuid4().hex[:8]}"
@@ -168,7 +179,7 @@ async def _stream_agent(order_id: str):
                 ]}}
         }
 
-        yield line(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "info")
+        yield evt(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "info")
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp_r = await client.post(agent_url, json=payload)
@@ -183,7 +194,7 @@ async def _stream_agent(order_id: str):
                     break
 
         if not awb_data or not awb_data.get("awb"):
-            yield line(f"  [ERROR] No AWB returned: {resp}", "error")
+            yield evt(f"  [ERROR] No AWB returned", "error")
             PROCESSING.discard(order_id)
             yield f"data: {json.dumps({'done': True, 'success': False})}\n\n"
             return
@@ -192,57 +203,53 @@ async def _stream_agent(order_id: str):
         carrier      = awb_data.get("carrier", "Delhivery")
         tracking_url = awb_data.get("tracking_url", f"https://www.delhivery.com/track/package/{awb}")
 
-        yield line(f"  [A2A] AWB received: {awb} | Carrier: {carrier}", "success")
+        yield evt(f"  [A2A] AWB received: {awb} | Carrier: {carrier}", "success")
         await asyncio.sleep(0.3)
 
-        # ── NODE 4 ────────────────────────────────────────────────
-        yield line("")
-        yield line(sep, "dim")
-        yield line("NODE 4: MCP update_order_status", "node")
-        yield line(sep, "dim")
+        yield evt("", "normal")
+        yield evt(sep, "dim")
+        yield evt("NODE 4: MCP update_order_status", "node")
+        yield evt(sep, "dim")
         await asyncio.sleep(0.4)
 
-        yield line(f"  [MCP -> update_order_status] order_id={order_id} awb={awb}", "info")
+        yield evt(f"  [MCP -> update_order_status] order_id={order_id} awb={awb}", "info")
 
         ORDERS[order_id].update({
-            "status":       "shipped",
-            "awb":          awb,
-            "carrier":      carrier,
+            "status": "shipped", "awb": awb, "carrier": carrier,
             "tracking_url": tracking_url,
-            "updated_at":   datetime.utcnow().isoformat() + "Z"
+            "updated_at": datetime.utcnow().isoformat() + "Z"
         })
         PROCESSING.discard(order_id)
 
-        yield line(f"  Order    : {order_id} -> shipped", "success")
-        yield line(f"  AWB      : {awb}", "data")
-        yield line(f"  Carrier  : {carrier}", "data")
-        yield line(f"  Tracking : {tracking_url}", "data")
+        yield evt(f"  Order    : {order_id} -> shipped", "success")
+        yield evt(f"  AWB      : {awb}", "data")
+        yield evt(f"  Carrier  : {carrier}", "data")
+        yield evt(f"  Tracking : {tracking_url}", "data")
         await asyncio.sleep(0.3)
 
-        # ── FOOTER ────────────────────────────────────────────────
-        yield line("")
-        yield line(sep, "dim")
-        yield line("FLOW COMPLETE", "node")
-        yield line(sep, "dim")
-        yield line("")
-        yield line(f"  [MCP] Connected to ecom MCP server via HTTP", "log")
-        yield line(f"  [MCP] Tools: ['get_order', 'update_order_status', 'list_pending_orders']", "log")
-        yield line(f"  [MCP -> get_order] order_id={order_id}", "log")
-        yield line(f"  [MCP] get_order -> {cust.get('name','?')} | {addr.get('city','?')} | {len(items)} item(s)", "log")
-        yield line(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "log")
-        yield line(f"  [A2A] Agent card: {agent_name} | Skills: {skills}", "log")
-        yield line(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "log")
-        yield line(f"  [A2A] AWB received: {awb} | Carrier: {carrier}", "log")
-        yield line(f"  [MCP -> update_order_status] order_id={order_id} awb={awb}", "log")
-        yield line(f"  [MCP] update_order_status success -> status: shipped", "log")
-        yield line("")
-        yield line(f"SUCCESS: #{order_id} | shipped | AWB: {awb} | {carrier}", "success_big")
+        yield evt("", "normal")
+        yield evt(sep, "dim")
+        yield evt("FLOW COMPLETE", "node")
+        yield evt(sep, "dim")
+        yield evt("", "normal")
+        yield evt(f"  [MCP] Connected to ecom MCP server via HTTP", "log")
+        yield evt(f"  [MCP] Tools: ['get_order', 'update_order_status', 'list_pending_orders']", "log")
+        yield evt(f"  [MCP -> get_order] order_id={order_id}", "log")
+        yield evt(f"  [MCP] get_order -> {cust.get('name','?')} | {addr.get('city','?')} | {len(items)} item(s)", "log")
+        yield evt(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "log")
+        yield evt(f"  [A2A] Agent card: {agent_name} | Skills: {skills}", "log")
+        yield evt(f"  [A2A] SendMessage -> {agent_url} | req_id={rid}", "log")
+        yield evt(f"  [A2A] AWB received: {awb} | Carrier: {carrier}", "log")
+        yield evt(f"  [MCP -> update_order_status] order_id={order_id} awb={awb}", "log")
+        yield evt(f"  [MCP] update_order_status success -> status: shipped", "log")
+        yield evt("", "normal")
+        yield evt(f"SUCCESS: #{order_id} | shipped | AWB: {awb} | {carrier}", "success_big")
 
         yield f"data: {json.dumps({'done': True, 'success': True, 'awb': awb, 'carrier': carrier})}\n\n"
 
     except Exception as e:
         PROCESSING.discard(order_id)
-        yield line(f"  [ERROR] {str(e)}", "error")
+        yield evt(f"  [ERROR] {str(e)}", "error")
         yield f"data: {json.dumps({'done': True, 'success': False})}\n\n"
 
 
@@ -256,13 +263,14 @@ def _rows():
         track = o.get("tracking_url") or ""
         items = ", ".join(f"{i['name']} x{i['qty']}" for i in o.get("items", []))
         city  = o["shipping_address"].get("city", "")
+        has_log = oid in LOG_HISTORY
 
         if s == "shipped":
             sb  = '<span class="badge s">✅ SHIPPED</span>'
             ab  = f'<span class="awb">{awb}</span>'
             cb  = f'<span class="car">{car}</span>'
             tb  = f'<a class="trk" href="{track}" target="_blank">Track →</a>'
-            btn = f'<button class="btn-done" onclick="openTerminal(\'{oid}\')">View Log</button>'
+            btn = f'<button class="btn-done" onclick="openTerminal(\'{oid}\')">{"📋 View Log" if has_log else "✓ Done"}</button>'
         elif oid in PROCESSING:
             sb  = '<span class="badge w">⚙ PROCESSING...</span>'
             ab  = cb = tb = '<span class="d">—</span>'
@@ -289,7 +297,7 @@ body{{font-family:'Segoe UI',sans-serif;background:#07090f;color:#e2e8f0;padding
 h1{{font-size:20px;font-weight:700;display:flex;align-items:center;gap:10px;margin-bottom:4px}}
 .live{{font-size:10px;font-weight:700;padding:3px 9px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#10b981;border-radius:20px;animation:pulse 2s infinite}}
 @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
-.sub{{font-size:12px;color:#4a5568;margin-bottom:18px}}
+.sub{{font-size:12px;color:#4a5568;margin-bottom:18px;margin-top:6px}}
 .stats{{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}}
 .sc{{background:#111827;border:1px solid #1e2d45;border-radius:10px;padding:12px 18px;min-width:130px}}
 .sl{{font-size:9px;font-weight:700;color:#4a5568;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}}
@@ -314,12 +322,14 @@ small{{font-size:10px;color:#4a5568}}
 .btn-run{{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:#10b981;padding:5px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;transition:all .2s}}
 .btn-run:hover{{background:rgba(16,185,129,.3);transform:scale(1.03)}}
 .btn-proc{{background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.3);color:#818cf8;padding:5px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:not-allowed}}
-.btn-done{{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);color:#3b82f6;padding:5px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer}}
-
+.btn-done{{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);color:#3b82f6;padding:5px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;transition:all .2s}}
+.btn-done:hover{{background:rgba(59,130,246,.25)}}
+.refresh-btn{{background:#1e2d45;border:1px solid #2d3f5a;color:#94a3b8;padding:6px 16px;border-radius:8px;font-size:12px;cursor:pointer;font-weight:600;margin-left:12px}}
+.refresh-btn:hover{{background:#2d3f5a}}
 /* Terminal overlay */
 #terminal-overlay{{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:1000;align-items:center;justify-content:center}}
 #terminal-overlay.show{{display:flex}}
-#terminal-box{{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:90%;max-width:900px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 25px 60px rgba(0,0,0,.8)}}
+#terminal-box{{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:90%;max-width:900px;max-height:87vh;display:flex;flex-direction:column;box-shadow:0 25px 60px rgba(0,0,0,.8)}}
 #terminal-header{{background:#161b22;border-bottom:1px solid #30363d;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-radius:12px 12px 0 0}}
 #terminal-title{{font-size:13px;font-weight:600;color:#e6edf3;font-family:monospace}}
 .term-dots{{display:flex;gap:7px}}
@@ -327,7 +337,7 @@ small{{font-size:10px;color:#4a5568}}
 .dot.r{{background:#ff5f56}}.dot.y{{background:#ffbd2e}}.dot.g{{background:#27c93f}}
 #terminal-close{{background:none;border:none;color:#8b949e;font-size:20px;cursor:pointer;padding:0 4px;line-height:1}}
 #terminal-close:hover{{color:#e6edf3}}
-#terminal-body{{padding:20px;overflow-y:auto;flex:1;font-family:'Courier New',Cascadia,monospace;font-size:13px;line-height:1.7;min-height:400px}}
+#terminal-body{{padding:20px;overflow-y:auto;flex:1;font-family:'Courier New',Cascadia,monospace;font-size:13px;line-height:1.7;min-height:420px}}
 #terminal-body .dim{{color:#444d56}}
 #terminal-body .title{{color:#e6edf3;font-weight:700}}
 #terminal-body .node{{color:#f0a500;font-weight:700}}
@@ -340,12 +350,15 @@ small{{font-size:10px;color:#4a5568}}
 #terminal-body .normal{{color:#c9d1d9}}
 #cursor{{display:inline-block;width:9px;height:16px;background:#56d364;margin-left:3px;animation:blink 1s infinite;vertical-align:middle}}
 @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:0}}}}
-#terminal-footer{{padding:10px 16px;border-top:1px solid #30363d;font-size:11px;color:#8b949e;font-family:monospace}}
+#terminal-footer{{padding:10px 16px;border-top:1px solid #30363d;font-size:11px;color:#8b949e;font-family:monospace;display:flex;justify-content:space-between}}
+#replay-badge{{display:none;background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);color:#3b82f6;padding:2px 10px;border-radius:10px;font-size:10px}}
 </style>
 </head><body>
 
-<h1>📦 Ecom Order Dashboard <span class="live">● LIVE</span></h1>
-<p class="sub" style="margin-top:6px">Auto-refreshes every 5s &nbsp;·&nbsp; Click <b style="color:#10b981">▶ Run Agent</b> to trigger A2A logistics agent with live terminal output</p>
+<h1>📦 Ecom Order Dashboard <span class="live">● LIVE</span>
+  <button class="refresh-btn" onclick="location.reload()">↻ Refresh</button>
+</h1>
+<p class="sub">Click <b style="color:#10b981">▶ Run Agent</b> to trigger A2A logistics agent &nbsp;·&nbsp; <b style="color:#3b82f6">📋 View Log</b> to replay any past run</p>
 
 <div class="stats" style="margin-top:14px">
   <div class="sc"><div class="sl">Pending AWB</div><div class="sv p">{confirmed}</div></div>
@@ -368,56 +381,67 @@ small{{font-size:10px;color:#4a5568}}
       <button id="terminal-close" onclick="closeTerminal()">✕</button>
     </div>
     <div id="terminal-body"></div>
-    <div id="terminal-footer" id="terminal-footer">Ready</div>
+    <div id="terminal-footer">
+      <span id="footer-text">Ready</span>
+      <span id="replay-badge">📋 Replayed from history</span>
+    </div>
   </div>
 </div>
 
 <script>
 let currentES = null;
-let autoRefreshTimer = null;
-
-function startAutoRefresh() {{
-  autoRefreshTimer = setTimeout(() => location.reload(), 5000);
-}}
-startAutoRefresh();
 
 function openTerminal(orderId) {{
-  clearTimeout(autoRefreshTimer);
-  const overlay  = document.getElementById('terminal-overlay');
-  const body     = document.getElementById('terminal-body');
-  const footer   = document.getElementById('terminal-footer');
-  const titleEl  = document.getElementById('terminal-title');
+  const overlay = document.getElementById('terminal-overlay');
+  const body    = document.getElementById('terminal-body');
+  const footer  = document.getElementById('footer-text');
+  const title   = document.getElementById('terminal-title');
+  const badge   = document.getElementById('replay-badge');
 
   body.innerHTML = '';
-  titleEl.textContent = `ecom-awb-agent — ${{orderId}} — bash`;
-  footer.textContent  = 'Connecting...';
+  title.textContent = `ecom-awb-agent — ${{orderId}} — bash`;
+  footer.textContent = 'Connecting...';
+  footer.style.color = '';
+  badge.style.display = 'none';
   overlay.classList.add('show');
 
   if (currentES) currentES.close();
+
+  // Add blinking cursor
+  const cursor = document.createElement('span');
+  cursor.id = 'cursor';
+  body.appendChild(cursor);
 
   currentES = new EventSource(`/run-agent-stream/${{orderId}}`);
 
   currentES.onmessage = (e) => {{
     const data = JSON.parse(e.data);
+
     if (data.done) {{
       currentES.close();
-      if (data.success) {{
-        footer.textContent = `SUCCESS — AWB: ${{data.awb}} | ${{data.carrier}} | Dashboard will refresh on close`;
-        footer.style.color = '#56d364';
-      }} else {{
-        footer.textContent = 'Agent flow failed — check logs above';
-        footer.style.color = '#ff7b72';
-      }}
-      // Remove cursor
       const cur = document.getElementById('cursor');
       if (cur) cur.remove();
+      if (data.replayed) {{
+        footer.textContent = `Log from previous run — AWB: ${{data.awb}} | ${{data.carrier}}`;
+        footer.style.color = '#3b82f6';
+        badge.style.display = 'inline';
+      }} else if (data.success) {{
+        footer.textContent = `SUCCESS — AWB: ${{data.awb}} | ${{data.carrier}}`;
+        footer.style.color = '#56d364';
+      }} else {{
+        footer.textContent = 'Agent flow failed';
+        footer.style.color = '#ff7b72';
+      }}
       return;
     }}
+
     if (data.line !== undefined) {{
-      const div  = document.createElement('div');
+      const div = document.createElement('div');
       div.className = data.type || 'normal';
       div.textContent = data.line;
-      body.appendChild(div);
+      const cur = document.getElementById('cursor');
+      if (cur) body.insertBefore(div, cur);
+      else body.appendChild(div);
       body.scrollTop = body.scrollHeight;
       footer.textContent = 'Running agent...';
     }}
@@ -427,22 +451,17 @@ function openTerminal(orderId) {{
     currentES.close();
     footer.textContent = 'Connection error';
     footer.style.color = '#ff7b72';
+    const cur = document.getElementById('cursor');
+    if (cur) cur.remove();
   }};
-
-  // Add blinking cursor
-  const cursor = document.createElement('span');
-  cursor.id = 'cursor';
-  body.appendChild(cursor);
 }}
 
 function closeTerminal() {{
   if (currentES) {{ currentES.close(); currentES = null; }}
   document.getElementById('terminal-overlay').classList.remove('show');
-  document.getElementById('terminal-footer').style.color = '';
-  location.reload();
+  document.getElementById('footer-text').style.color = '';
 }}
 
-// Close on overlay click
 document.getElementById('terminal-overlay').addEventListener('click', (e) => {{
   if (e.target === document.getElementById('terminal-overlay')) closeTerminal();
 }});
