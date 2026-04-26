@@ -16,12 +16,33 @@ import httpx
 # LangSmith tracing
 os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
 os.environ.setdefault("LANGCHAIN_PROJECT",    "ecom-awb-a2a")
-try:
-    from langsmith import traceable
-except ImportError:
-    def traceable(name=None, run_type=None):
-        def decorator(fn): return fn
-        return decorator
+
+def ls_trace(name: str, inputs: dict, outputs: dict = None, error: str = None):
+    """Fire a LangSmith trace run directly via REST API."""
+    try:
+        import httpx as _httpx, uuid as _uuid, time as _time
+        api_key = os.getenv("LANGCHAIN_API_KEY", "")
+        project = os.getenv("LANGCHAIN_PROJECT", "ecom-awb-a2a")
+        if not api_key:
+            return
+        run_id = str(_uuid.uuid4())
+        now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        payload = {
+            "id": run_id, "name": name, "run_type": "chain",
+            "inputs": inputs, "outputs": outputs or {},
+            "start_time": now, "end_time": now,
+            "project_name": project,
+            "status": "error" if error else "success",
+            "error": error
+        }
+        _httpx.post(
+            "https://api.smith.langchain.com/runs",
+            json=payload,
+            headers={"x-api-key": api_key, "Content-Type": "application/json"},
+            timeout=5.0
+        )
+    except Exception:
+        pass  # Never break the main flow for tracing
 
 app = FastAPI(title="Ecom Order Service", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -196,9 +217,6 @@ async def run_refund_stream(order_id: str):
 
 # ── Agent flow implementations ─────────────────────────────────────────────────
 
-@traceable(name="ship_order_agent", run_type="chain")
-async def _trace_ship(order_id: str, order_data: dict): pass  # LangSmith trace anchor
-
 async def _stream_ship(order_id: str):
     sep   = "=" * 60
     order = ORDERS[order_id]
@@ -222,10 +240,6 @@ async def _stream_ship(order_id: str):
         async for line in wake_service(LOGISTICS_AGENT_URL, "Logistics Agent", evt):
             yield line
         await asyncio.sleep(0.2)
-
-        # Fire LangSmith trace
-        try: _trace_ship(order_id, order)
-        except: pass
 
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: MCP INIT + GET ORDER", "node")
@@ -312,6 +326,7 @@ async def _stream_ship(order_id: str):
         yield evt(f"  [MCP] update_order_status success -> status: shipped", "log")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | shipped | AWB: {awb} | {carrier}", "success_big")
+        ls_trace("ship_order", {"order_id": order_id, "customer": order.get("customer",{}).get("name"), "total": order.get("total")}, {"awb": awb, "carrier": carrier, "status": "shipped"})
         yield f"data: {json.dumps({'done':True,'success':True,'awb':awb,'carrier':carrier})}\n\n"
 
     except Exception as e:
@@ -319,9 +334,6 @@ async def _stream_ship(order_id: str):
         yield evt(f"  [ERROR] {str(e)}", "error")
         yield f"data: {json.dumps({'done':True,'success':False})}\n\n"
 
-
-@traceable(name="return_order_agent", run_type="chain")
-async def _trace_return(order_id: str, order_data: dict): pass  # LangSmith trace anchor
 
 async def _stream_return(order_id: str):
     sep     = "=" * 60
@@ -462,6 +474,7 @@ async def _stream_return(order_id: str):
         yield evt(f"  Carrier    : {carrier}", "data")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | return_initiated | Reverse AWB: {reverse_awb}", "success_big")
+        ls_trace("return_order", {"order_id": order_id}, {"reverse_awb": reverse_awb, "carrier": carrier, "status": "return_initiated"})
         yield f"data: {json.dumps({'done':True,'success':True,'reverse_awb':reverse_awb,'carrier':carrier})}\n\n"
 
     except Exception as e:
@@ -469,9 +482,6 @@ async def _stream_return(order_id: str):
         yield evt(f"  [ERROR] {str(e)}", "error")
         yield f"data: {json.dumps({'done':True,'success':False})}\n\n"
 
-
-@traceable(name="refund_order_agent", run_type="chain")
-async def _trace_refund(order_id: str, order_data: dict): pass  # LangSmith trace anchor
 
 async def _stream_refund(order_id: str):
     sep     = "=" * 60
@@ -603,9 +613,8 @@ async def _stream_refund(order_id: str):
             await asyncio.sleep(0.2)
 
         if not items_restocked:
-            for item in order.get("items", []):
-                yield evt(f"  [MCP] POST /tools/call → inventory_refilled: {item.get('sku')}", "info")
-                yield evt(f"  [Airtable] Stock updated ✓", "success")
+            yield evt(f"  [WARN] Inventory restock returned no items — check AIRTABLE_TOKEN on ecom-inventory-mcp", "error")
+            yield evt(f"  [WARN] Verify Render env vars: AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID", "error")
         await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
@@ -633,6 +642,7 @@ async def _stream_refund(order_id: str):
         yield evt(f"  Items restocked in Airtable: {len(items_restocked) or len(order.get('items',[]))}", "data")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | refunded + restocked | Ref: {refund_id} | Rs.{refund_amount}", "success_big")
+        ls_trace("refund_order", {"order_id": order_id, "total": order.get("total")}, {"refund_id": refund_id, "refund_amount": refund_amount, "status": "restocked", "items_restocked": len(items_restocked)})
         yield f"data: {json.dumps({'done':True,'success':True,'refund_id':refund_id,'refund_amount':refund_amount})}\n\n"
 
     except Exception as e:
