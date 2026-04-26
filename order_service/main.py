@@ -17,29 +17,13 @@ import httpx
 os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
 os.environ.setdefault("LANGCHAIN_PROJECT",    "ecom-awb-a2a")
 
-def ls_trace(name: str, inputs: dict, outputs: dict = None, error: str = None):
-    """Fire a LangSmith trace run directly via REST API."""
+def _ls_post(payload: dict):
+    """Post to LangSmith REST API."""
     try:
-        import httpx as _httpx, uuid as _uuid, time as _time
+        import httpx as _httpx
         api_key = os.getenv("LANGCHAIN_API_KEY", "")
-        project = os.getenv("LANGCHAIN_PROJECT", "ecom-awb-a2a")
         if not api_key:
             return
-        run_id = str(_uuid.uuid4())
-        now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
-        payload = {
-            "id": run_id,
-            "name": name,
-            "run_type": "chain",
-            "inputs": inputs,
-            "outputs": outputs or {},
-            "start_time": now,
-            "end_time": now,
-            "session_name": project,
-            "extra": {"metadata": {"project": project}}
-        }
-        if error:
-            payload["error"] = error
         _httpx.post(
             "https://api.smith.langchain.com/runs",
             json=payload,
@@ -47,7 +31,59 @@ def ls_trace(name: str, inputs: dict, outputs: dict = None, error: str = None):
             timeout=5.0
         )
     except Exception:
-        pass  # Never break the main flow for tracing
+        pass
+
+def ls_start_run(name: str, inputs: dict, run_type="chain", parent_id=None) -> str:
+    """Start a LangSmith run, return run_id."""
+    try:
+        import uuid as _uuid, time as _time
+        project = os.getenv("LANGCHAIN_PROJECT", "ecom-awb-a2a")
+        run_id  = str(_uuid.uuid4())
+        now     = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        payload = {
+            "id": run_id, "name": name, "run_type": run_type,
+            "inputs": inputs, "start_time": now,
+            "session_name": project
+        }
+        if parent_id:
+            payload["parent_run_id"] = parent_id
+        _ls_post(payload)
+        return run_id
+    except Exception:
+        return ""
+
+def ls_end_run(run_id: str, outputs: dict = None, error: str = None):
+    """End a LangSmith run with outputs."""
+    try:
+        import time as _time
+        if not run_id:
+            return
+        now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        payload = {
+            "id": run_id, "end_time": now,
+            "outputs": outputs or {}
+        }
+        if error:
+            payload["error"] = error
+        try:
+            import httpx as _httpx
+            api_key = os.getenv("LANGCHAIN_API_KEY", "")
+            if api_key:
+                _httpx.patch(
+                    f"https://api.smith.langchain.com/runs/{run_id}",
+                    json=payload,
+                    headers={"x-api-key": api_key, "Content-Type": "application/json"},
+                    timeout=5.0
+                )
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def ls_trace(name: str, inputs: dict, outputs: dict = None, error: str = None):
+    """Fire a complete single LangSmith trace (for backward compat)."""
+    run_id = ls_start_run(name, inputs)
+    ls_end_run(run_id, outputs, error)
 
 app = FastAPI(title="Ecom Order Service", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -246,10 +282,14 @@ async def _stream_ship(order_id: str):
             yield line
         await asyncio.sleep(0.2)
 
+        # LangSmith parent run
+        ls_parent = ls_start_run("ship_order_agent", {"order_id": order_id, "customer": order.get("customer",{}).get("name"), "total": order.get("total")})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: MCP INIT + GET ORDER", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_n1 = ls_start_run("node_1_mcp_get_order", {"order_id": order_id}, parent_id=ls_parent)
         cust       = order.get("customer", {})
         addr       = order.get("shipping_address", {})
         items      = order.get("items", [])
@@ -262,10 +302,13 @@ async def _stream_ship(order_id: str):
         yield evt(f"  Total    : Rs.{order.get('total','?')}", "data")
         await asyncio.sleep(0.3)
 
+        ls_end_run(ls_n1, {"customer": cust.get("name"), "city": addr.get("city"), "items": len(items)})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 2: A2A AGENT DISCOVERY", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_n2 = ls_start_run("node_2_a2a_discovery", {"logistics_url": LOGISTICS_AGENT_URL}, parent_id=ls_parent)
         yield evt(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "info")
         async with httpx.AsyncClient(timeout=30.0) as client:
             card   = (await client.get(f"{LOGISTICS_AGENT_URL}/.well-known/agent-card.json")).json()
@@ -273,12 +316,14 @@ async def _stream_ship(order_id: str):
         skills     = [s["id"] for s in card.get("skills", [])]
         agent_url  = card.get("supportedInterfaces", [{}])[0].get("url", LOGISTICS_AGENT_URL)
         yield evt(f"  [A2A] Agent card: {agent_name} | Skills: {skills}", "success")
+        ls_end_run(ls_n2, {"agent": agent_name, "skills": skills, "url": agent_url})
         await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 3: A2A SendMessage", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_n3 = ls_start_run("node_3_a2a_send_message", {"order_id": order_id, "agent": agent_name}, parent_id=ls_parent)
         rid     = f"req-{uuid.uuid4().hex[:8]}"
         payload = {
             "jsonrpc": "2.0", "id": rid, "method": "SendMessage",
@@ -305,12 +350,14 @@ async def _stream_ship(order_id: str):
         carrier      = awb_data.get("carrier", "Delhivery")
         tracking_url = awb_data.get("tracking_url", f"https://www.delhivery.com/track/package/{awb}")
         yield evt(f"  [A2A] AWB received: {awb} | Carrier: {carrier}", "success")
+        ls_end_run(ls_n3, {"awb": awb, "carrier": carrier})
         await asyncio.sleep(0.3)
 
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 4: MCP update_order_status", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_n4 = ls_start_run("node_4_mcp_update_status", {"order_id": order_id, "awb": awb, "carrier": carrier}, parent_id=ls_parent)
         yield evt(f"  [MCP -> update_order_status] order_id={order_id} awb={awb}", "info")
         ORDERS[order_id].update({
             "status": "shipped", "awb": awb, "carrier": carrier,
@@ -331,7 +378,8 @@ async def _stream_ship(order_id: str):
         yield evt(f"  [MCP] update_order_status success -> status: shipped", "log")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | shipped | AWB: {awb} | {carrier}", "success_big")
-        ls_trace("ship_order", {"order_id": order_id, "customer": order.get("customer",{}).get("name"), "total": order.get("total")}, {"awb": awb, "carrier": carrier, "status": "shipped"})
+        ls_end_run(ls_n4, {"status": "shipped", "awb": awb})
+        ls_end_run(ls_parent, {"order_id": order_id, "awb": awb, "carrier": carrier, "status": "shipped"})
         yield f"data: {json.dumps({'done':True,'success':True,'awb':awb,'carrier':carrier})}\n\n"
 
     except Exception as e:
@@ -366,10 +414,13 @@ async def _stream_return(order_id: str):
             yield line
         await asyncio.sleep(0.2)
 
+        ls_ret_parent = ls_start_run("return_order_agent", {"order_id": order_id, "customer": order.get("customer",{}).get("name")})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: RETURN ELIGIBILITY CHECK", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_ret_n1 = ls_start_run("node_1_eligibility_check", {"order_id": order_id, "return_window_days": RETURN_WINDOW_DAYS}, parent_id=ls_ret_parent)
         shipped_at = order.get("shipped_at")
         if shipped_at:
             shipped_dt = datetime.fromisoformat(shipped_at.replace("Z", "+00:00"))
@@ -386,10 +437,13 @@ async def _stream_return(order_id: str):
             yield evt(f"  Return window check: passed", "success")
         await asyncio.sleep(0.3)
 
+        ls_end_run(ls_ret_n1, {"eligible": True, "shipped_at": shipped_at})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 2: A2A → RETURNS AGENT", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_ret_n2 = ls_start_run("node_2_a2a_returns_agent", {"order_id": order_id, "returns_url": RETURNS_AGENT_URL}, parent_id=ls_ret_parent)
         yield evt(f"  [A2A] GET {RETURNS_AGENT_URL}/.well-known/agent-card.json", "info")
         async with httpx.AsyncClient(timeout=30.0) as client:
             card      = (await client.get(f"{RETURNS_AGENT_URL}/.well-known/agent-card.json")).json()
@@ -456,10 +510,13 @@ async def _stream_return(order_id: str):
         yield evt(f"  [A2A] Tracking    : {tracking_url}", "data")
         await asyncio.sleep(0.3)
 
+        ls_end_run(ls_ret_n2, {"reverse_awb": reverse_awb, "carrier": carrier})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 3: MCP update_order_status", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_ret_n3 = ls_start_run("node_3_mcp_update_return", {"order_id": order_id, "reverse_awb": reverse_awb}, parent_id=ls_ret_parent)
         yield evt(f"  [MCP -> update_order_status]", "info")
         yield evt(f"  [MCP]   order_id     = {order_id}", "log")
         yield evt(f"  [MCP]   status       = return_initiated", "log")
@@ -479,7 +536,8 @@ async def _stream_return(order_id: str):
         yield evt(f"  Carrier    : {carrier}", "data")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | return_initiated | Reverse AWB: {reverse_awb}", "success_big")
-        ls_trace("return_order", {"order_id": order_id}, {"reverse_awb": reverse_awb, "carrier": carrier, "status": "return_initiated"})
+        ls_end_run(ls_ret_n3, {"status": "return_initiated", "reverse_awb": reverse_awb})
+        ls_end_run(ls_ret_parent, {"order_id": order_id, "reverse_awb": reverse_awb, "status": "return_initiated"})
         yield f"data: {json.dumps({'done':True,'success':True,'reverse_awb':reverse_awb,'carrier':carrier})}\n\n"
 
     except Exception as e:
@@ -514,10 +572,13 @@ async def _stream_refund(order_id: str):
             yield line
         await asyncio.sleep(0.2)
 
+        ls_ref_parent = ls_start_run("refund_order_agent", {"order_id": order_id, "total": order.get("total")})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 1: A2A → REFUND AGENT", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_ref_n1 = ls_start_run("node_1_a2a_refund_agent", {"order_id": order_id, "refund_url": REFUND_AGENT_URL}, parent_id=ls_ref_parent)
         yield evt(f"  [A2A] GET {REFUND_AGENT_URL}/.well-known/agent-card.json", "info")
         async with httpx.AsyncClient(timeout=30.0) as client:
             card      = (await client.get(f"{REFUND_AGENT_URL}/.well-known/agent-card.json")).json()
@@ -590,9 +651,13 @@ async def _stream_refund(order_id: str):
         yield evt(f"  [A2A] Method       : original_payment", "data")
         await asyncio.sleep(0.3)
 
+        ls_end_run(ls_ref_n1, {"refund_id": refund_id, "refund_amount": refund_amount})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 2: INVENTORY RESTOCK — MCP Tool Results", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
+
+        ls_ref_n2 = ls_start_run("node_2_mcp_inventory_restock", {"order_id": order_id, "mcp_server": INVENTORY_MCP_URL, "items": [i.get('sku') for i in order.get('items',[])]}, parent_id=ls_ref_parent)
 
         items_restocked = inv_result.get("items_restocked", [])
         tools_discovered = inv_result.get("tools_discovered", ["inventory_refilled", "get_stock_level", "list_inventory"])
@@ -622,10 +687,13 @@ async def _stream_refund(order_id: str):
             yield evt(f"  [WARN] Verify Render env vars: AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID", "error")
         await asyncio.sleep(0.3)
 
+        ls_end_run(ls_ref_n2, {"items_restocked": len(items_restocked), "tool": "inventory_refilled"})
+
         yield evt(""); yield evt(sep, "dim")
         yield evt("NODE 3: MCP update_order_status", "node")
         yield evt(sep, "dim"); await asyncio.sleep(0.4)
 
+        ls_ref_n3 = ls_start_run("node_3_mcp_update_refund", {"order_id": order_id, "refund_id": refund_id}, parent_id=ls_ref_parent)
         yield evt(f"  [MCP -> update_order_status]", "info")
         yield evt(f"  [MCP]   order_id      = {order_id}", "log")
         yield evt(f"  [MCP]   status        = restocked", "log")
@@ -647,7 +715,8 @@ async def _stream_refund(order_id: str):
         yield evt(f"  Items restocked in Airtable: {len(items_restocked) or len(order.get('items',[]))}", "data")
         yield evt("")
         yield evt(f"SUCCESS: #{order_id} | refunded + restocked | Ref: {refund_id} | Rs.{refund_amount}", "success_big")
-        ls_trace("refund_order", {"order_id": order_id, "total": order.get("total")}, {"refund_id": refund_id, "refund_amount": refund_amount, "status": "restocked", "items_restocked": len(items_restocked)})
+        ls_end_run(ls_ref_n3, {"status": "restocked", "refund_id": refund_id})
+        ls_end_run(ls_ref_parent, {"order_id": order_id, "refund_id": refund_id, "refund_amount": refund_amount, "status": "restocked", "items_restocked": len(items_restocked)})
         yield f"data: {json.dumps({'done':True,'success':True,'refund_id':refund_id,'refund_amount':refund_amount})}\n\n"
 
     except Exception as e:
