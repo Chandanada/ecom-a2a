@@ -221,3 +221,19 @@ async def _list_inventory() -> dict:
             "return_reason": f.get("Return Reason", "")
         })
     return {"inventory": items, "count": len(items)}
+
+
+@app.delete("/inventory/reset")
+async def reset_inventory():
+    """Delete all Airtable records - called on order_service startup to sync with reset orders."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(AIRTABLE_BASE_URL, headers=airtable_headers())
+        r.raise_for_status()
+        records = r.json().get("records", [])
+        deleted = []
+        for rec in records:
+            rid = rec["id"]
+            dr  = await client.delete(f"{AIRTABLE_BASE_URL}/{rid}", headers=airtable_headers())
+            if dr.status_code == 200:
+                deleted.append(rid)
+    return {"success": True, "deleted": len(deleted), "message": "Airtable inventory cleared"}

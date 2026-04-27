@@ -86,6 +86,16 @@ def ls_trace(name: str, inputs: dict, outputs: dict = None, error: str = None):
     ls_end_run(run_id, outputs, error)
 
 app = FastAPI(title="Ecom Order Service", version="4.0.0")
+
+@app.on_event("startup")
+async def startup_reset_inventory():
+    """Clear Airtable inventory on every deploy to stay in sync with reset order data."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.delete(f"{INVENTORY_MCP_URL}/inventory/reset")
+            print(f"Inventory reset on startup: {r.json()}")
+    except Exception as e:
+        print(f"Inventory reset skipped: {e}")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 LOGISTICS_AGENT_URL = os.getenv("LOGISTICS_AGENT_URL", "https://ecom-logistics-agent.onrender.com")
@@ -115,8 +125,8 @@ ORDERS = {
 PROCESSING  = set()
 LOG_HISTORY = {}
 
-COLD_START_RETRIES = 3
-COLD_START_WAIT    = 15  # seconds
+COLD_START_RETRIES = 5
+COLD_START_WAIT    = 20  # seconds
 
 async def wake_service(url: str, name: str, evt_fn=None):
     """Ping Render service health endpoint — waits through cold start. Async generator."""
@@ -310,8 +320,9 @@ async def _stream_ship(order_id: str):
 
         ls_n2 = ls_start_run("node_2_a2a_discovery", {"logistics_url": LOGISTICS_AGENT_URL}, parent_id=ls_parent)
         yield evt(f"  [A2A] GET {LOGISTICS_AGENT_URL}/.well-known/agent-card.json", "info")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            card   = (await client.get(f"{LOGISTICS_AGENT_URL}/.well-known/agent-card.json")).json()
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            card_r = await client.get(f"{LOGISTICS_AGENT_URL}/.well-known/agent-card.json")
+            card   = card_r.json() if card_r.text.strip() else {}
         agent_name = card.get("name", "Logistics Agent")
         skills     = [s["id"] for s in card.get("skills", [])]
         agent_url  = card.get("supportedInterfaces", [{}])[0].get("url", LOGISTICS_AGENT_URL)
