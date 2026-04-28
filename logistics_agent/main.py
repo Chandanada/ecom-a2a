@@ -5,10 +5,11 @@ Accepts A2A SendMessage with order details.
 Calls Shiprocket API to generate real AWB.
 Returns AWB number as A2A artifact.
 """
-import os, uuid, httpx
+import os, uuid, httpx, re
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,7 +19,21 @@ SHIPROCKET_EMAIL    = os.getenv("SHIPROCKET_EMAIL", "")
 SHIPROCKET_PASSWORD = os.getenv("SHIPROCKET_PASSWORD", "")
 ORDER_SERVICE_URL   = os.getenv("ORDER_SERVICE_URL", "http://localhost:8000")
 
+# Methods we accept — covers all callers (dashboard, agent_ecom, direct curl)
+SUPPORTED_METHODS = {"SendMessage", "message/send", "messages/send", "generate_awb"}
+
+# Regex to pull ORD-XXX from plain-text prompts
+ORDER_ID_RE = re.compile(r"\bORD-\d+\b", re.IGNORECASE)
+
 app = FastAPI(title="Logistics Agent", version="1.0.0")
+
+# ── CORS — allow any origin so agent card + POST work from anywhere ────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── A2A Agent Card ────────────────────────────────────────────────────────────
 AGENT_CARD = {
@@ -48,9 +63,9 @@ AGENT_CARD = {
         "inputModes":  ["application/json"],
         "outputModes": ["application/json"]
     }],
-    "signatures": None,
+    "signatures":      None,
     "securitySchemes": None,
-    "security": None
+    "security":        None
 }
 
 
@@ -72,7 +87,7 @@ async def get_shiprocket_token() -> str:
     if _sr_token:
         return _sr_token
     if not SHIPROCKET_EMAIL or not SHIPROCKET_PASSWORD:
-        return None  # will use mock mode
+        return None  # mock mode
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://apiv2.shiprocket.in/v1/external/auth/login",
@@ -84,13 +99,24 @@ async def get_shiprocket_token() -> str:
         return _sr_token
 
 
+async def fetch_order_from_service(order_id: str) -> dict:
+    """Pull order data from ORDER_SERVICE_URL when only order ID given in prompt."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(f"{ORDER_SERVICE_URL}/orders/{order_id}")
+            if r.status_code == 200:
+                return r.json()
+    except Exception as e:
+        print(f"[fetch_order] {order_id} failed: {e}")
+    return {}
+
+
 async def create_shiprocket_shipment(order: dict) -> dict:
     """Create real Shiprocket shipment and get AWB."""
     token = await get_shiprocket_token()
 
     if not token:
-        # Mock mode — real AWB format, but generated locally
-        # Use when Shiprocket credentials not configured
+        # Mock mode — real AWB format, generated locally
         mock_awb = f"SR{uuid.uuid4().int % 10**10:010d}"
         return {
             "awb":          mock_awb,
@@ -100,40 +126,36 @@ async def create_shiprocket_shipment(order: dict) -> dict:
             "mode":         "mock"
         }
 
-    addr    = order.get("shipping_address", {})
-    items   = order.get("items", [])
+    addr     = order.get("shipping_address", {})
+    items    = order.get("items", [])
     customer = order.get("customer", {})
 
     payload = {
         "order_id":        order["id"],
         "order_date":      datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
         "pickup_location": "Primary",
-        "billing_customer_name":    customer.get("name", ""),
-        "billing_last_name":        "",
-        "billing_address":          addr.get("line1", ""),
-        "billing_city":             addr.get("city", ""),
-        "billing_pincode":          addr.get("pincode", ""),
-        "billing_state":            addr.get("state", ""),
-        "billing_country":          "India",
-        "billing_email":            customer.get("email", ""),
-        "billing_phone":            customer.get("phone", ""),
-        "shipping_is_billing":      True,
+        "billing_customer_name": customer.get("name", ""),
+        "billing_last_name":     "",
+        "billing_address":       addr.get("line1", ""),
+        "billing_city":          addr.get("city", ""),
+        "billing_pincode":       addr.get("pincode", ""),
+        "billing_state":         addr.get("state", ""),
+        "billing_country":       "India",
+        "billing_email":         customer.get("email", ""),
+        "billing_phone":         customer.get("phone", ""),
+        "shipping_is_billing":   True,
         "order_items": [{
-            "name":     item.get("name", ""),
-            "sku":      item.get("sku", "SKU001"),
-            "units":    item.get("qty", 1),
+            "name":          item.get("name", ""),
+            "sku":           item.get("sku", "SKU001"),
+            "units":         item.get("qty", 1),
             "selling_price": str(item.get("price", 0))
         } for item in items],
         "payment_method": "Prepaid",
         "sub_total":      order.get("total", 0),
-        "length":         15,
-        "breadth":        10,
-        "height":         5,
-        "weight":         0.5
+        "length": 15, "breadth": 10, "height": 5, "weight": 0.5
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Step 1: Create order
         r = await client.post(
             "https://apiv2.shiprocket.in/v1/external/orders/create/adhoc",
             json=payload,
@@ -145,7 +167,6 @@ async def create_shiprocket_shipment(order: dict) -> dict:
         if not shipment_id:
             raise Exception(f"Shiprocket order creation failed: {order_data}")
 
-        # Step 2: Generate AWB
         r2 = await client.post(
             "https://apiv2.shiprocket.in/v1/external/courier/assign/awb",
             json={"shipment_id": str(shipment_id)},
@@ -164,32 +185,54 @@ async def create_shiprocket_shipment(order: dict) -> dict:
         }
 
 
+def extract_text_from_parts(parts: list) -> str:
+    texts = []
+    for part in parts:
+        text = part.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return " ".join(texts)
+
+
 # ── A2A SendMessage handler ───────────────────────────────────────────────────
 @app.post("/")
 async def handle_message(request: Request):
     try:
         body   = await request.json()
         req_id = body.get("id", "req-001")
+        method = body.get("method", "")
 
-        if body.get("method") != "SendMessage":
+        # Accept any supported method name
+        if method not in SUPPORTED_METHODS:
             return JSONResponse({
                 "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32601, "message": "Method not found"}
+                "error": {"code": -32601, "message": f"Method '{method}' not supported. Use one of: {sorted(SUPPORTED_METHODS)}"}
             })
 
-        parts = body.get("params", {}).get("message", {}).get("parts", [])
+        params  = body.get("params", {})
+        message = params.get("message", {})
+        parts   = message.get("parts", [])
+
+        # Try structured data part first
         data  = next((p.get("data") for p in parts if "data" in p), {})
-        order = data.get("order", data)  # accept either {order: {...}} or flat order dict
+        order = data.get("order", data) if data else {}
+
+        # If no structured order, try parsing order ID from text and fetch it
+        if not order.get("id"):
+            prompt_text = extract_text_from_parts(parts)
+            match       = ORDER_ID_RE.search(prompt_text)
+            if match:
+                order_id = match.group(0).upper()
+                print(f"[handle_message] No data part — fetching {order_id} from order service")
+                order = await fetch_order_from_service(order_id)
 
         if not order.get("id"):
             return JSONResponse({
                 "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32600, "message": "order.id required in data part"}
+                "error": {"code": -32600, "message": "order.id required — pass data part with order dict, or include ORD-XXX in text"}
             })
 
-        # Generate AWB via Shiprocket
-        result = await create_shiprocket_shipment(order)
-
+        result     = await create_shiprocket_shipment(order)
         task_id    = str(uuid.uuid4())
         context_id = str(uuid.uuid4())
 
